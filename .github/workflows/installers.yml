@@ -1,0 +1,237 @@
+# Builds and tests the macOS (Apple Silicon and Intel) and Windows installers.
+#
+# - Every push and pull request: build and smoke-test all installers. They are kept as
+#   workflow artifacts (Actions > the run > Artifacts).
+# - Pushing a tag v<version> (matching `version` in gradle.properties) also publishes a
+#   GitHub release with the installers attached, once they have all been built and tested.
+#   A tag with a hyphen (v1.1.0-beta1) is published as a pre-release.
+#
+# dotify-studio is built from source first, because the version that's packaged
+# (`dotifyStudioVersion` in gradle.properties) isn't on Maven Central yet.
+#
+# Optional secrets for macOS signing and notarization (without them, the installers are
+# unsigned, and macOS blocks the app after it has been downloaded):
+#   MACOS_CERTIFICATE           base64 of a "Developer ID Application" certificate exported as .p12
+#   MACOS_CERTIFICATE_PASSWORD  password of the .p12
+#   APPLE_ID                    Apple ID of the developer account
+#   APPLE_TEAM_ID               team ID of the developer account
+#   APPLE_APP_PASSWORD          app-specific password for the Apple ID (appleid.apple.com)
+name: Installers
+
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      studio_repository:
+        description: 'dotify-studio repository to build'
+        required: false
+      studio_ref:
+        description: 'dotify-studio branch, tag or commit to build'
+        required: false
+
+permissions:
+  contents: read
+
+env:
+  STUDIO_REPOSITORY: ${{ inputs.studio_repository || vars.DOTIFY_STUDIO_REPOSITORY || format('{0}/dotify-studio', github.repository_owner) }}
+  STUDIO_REF: ${{ inputs.studio_ref || vars.DOTIFY_STUDIO_REF || '' }}
+
+jobs:
+  dotify-studio:
+    name: Build dotify-studio
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.STUDIO_REPOSITORY }}
+          ref: ${{ env.STUDIO_REF }}
+          fetch-depth: 0
+      - uses: actions/setup-java@v6
+        with:
+          distribution: zulu
+          java-version: 21
+      - uses: gradle/actions/setup-gradle@v6
+      - name: Publish to the local Maven repository
+        run: ./gradlew publishToMavenLocal
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dotify-studio-maven
+          path: ~/.m2/repository/org/daisy/dotify/dotify-studio
+          if-no-files-found: error
+          retention-days: 1
+
+  macos:
+    name: macOS (${{ matrix.name }})
+    needs: dotify-studio
+    # Apple Silicon runner. The Intel installer is built here too, and tested with Rosetta.
+    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Apple Silicon
+            arch: aarch64
+          - name: Intel
+            arch: x64
+    env:
+      MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+      MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: dotify-studio-maven
+          path: ~/.m2/repository/org/daisy/dotify/dotify-studio
+      - uses: actions/setup-java@v6
+        with:
+          distribution: zulu
+          java-version: 21
+      - uses: gradle/actions/setup-gradle@v6
+      - name: Install Rosetta
+        if: matrix.arch == 'x64'
+        run: /usr/sbin/softwareupdate --install-rosetta --agree-to-license
+      - name: Set up signing
+        if: env.MACOS_CERTIFICATE != ''
+        run: |
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          keychain_password="$(uuidgen)"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          echo "$MACOS_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          security import "$RUNNER_TEMP/certificate.p12" -P "$MACOS_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
+          rm "$RUNNER_TEMP/certificate.p12"
+          security set-key-partition-list -S apple-tool:,apple: -k "$keychain_password" "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          identity="$(security find-identity -v -p codesigning "$keychain" | awk -F'"' '/Developer ID Application/ {print $2; exit}')"
+          if [ -z "$identity" ]; then echo "No Developer ID Application certificate in MACOS_CERTIFICATE"; exit 1; fi
+          echo "ORG_GRADLE_PROJECT_macSigningIdentity=$identity" >> "$GITHUB_ENV"
+          if [ -n "$APPLE_ID" ]; then
+            xcrun notarytool store-credentials dotify-notary --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" \
+              --password "$APPLE_APP_PASSWORD" --keychain "$keychain"
+            echo "ORG_GRADLE_PROJECT_macNotaryProfile=dotify-notary" >> "$GITHUB_ENV"
+            echo "REQUIRE_NOTARIZED=1" >> "$GITHUB_ENV"
+          fi
+      - name: Build
+        run: ./gradlew dmg -PtargetArch=${{ matrix.arch }}
+      - name: Test
+        run: scripts/test-dmg.sh build/distributions/*.dmg
+      - uses: actions/upload-artifact@v7
+        with:
+          name: installer-macos-${{ matrix.arch }}
+          path: build/distributions/*.dmg
+          if-no-files-found: error
+
+  windows:
+    name: Windows (x64)
+    needs: dotify-studio
+    # Has the WiX Toolset 3 that the msi task needs.
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: dotify-studio-maven
+          path: ~/.m2/repository/org/daisy/dotify/dotify-studio
+      - uses: actions/setup-java@v6
+        with:
+          distribution: zulu
+          java-version: 21
+      - uses: gradle/actions/setup-gradle@v6
+      - name: Check WiX Toolset
+        shell: pwsh
+        run: |
+          if (-not $env:WIX -or -not (Test-Path (Join-Path $env:WIX 'bin\candle.exe'))) {
+            choco install wixtoolset --version 3.14.1 -y --no-progress
+            $wix = (Get-ChildItem "${env:ProgramFiles(x86)}" -Filter 'WiX Toolset v3*' -Directory | Select-Object -First 1).FullName
+            "WIX=$wix\" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          }
+      - name: Build
+        run: ./gradlew msi
+      - name: Test
+        shell: pwsh
+        run: scripts/test-msi.ps1 (Get-ChildItem build/distributions/*.msi | Select-Object -First 1).FullName
+      - uses: actions/upload-artifact@v7
+        with:
+          name: installer-windows-x64
+          path: build/distributions/*.msi
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [macos, windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check that the tag matches the version
+        run: |
+          version="$(sed -n 's/^version=//p' gradle.properties | tr -d '\r')"
+          if [ "${GITHUB_REF_NAME}" != "v${version}" ]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match version=${version} in gradle.properties"
+            exit 1
+          fi
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: installer-*
+          path: installers
+          merge-multiple: true
+      - name: Write release notes
+        run: |
+          {
+            echo '## Download'
+            echo
+            echo '| Computer | Installer |'
+            echo '| :-- | :-- |'
+            for file in installers/*; do
+              name="$(basename "$file")"
+              case "$name" in
+                *macos-apple-silicon*) computer='Mac with Apple Silicon (M1 or later)';;
+                *macos-intel*) computer='Mac with an Intel processor';;
+                *windows*) computer='Windows (64-bit)';;
+                *) computer='Other';;
+              esac
+              echo "| $computer | [$name](https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/$name) |"
+            done
+          } > notes.md
+          cat >> notes.md <<'EOF'
+
+          Not sure which Mac you have? Open the Apple menu > About This Mac and look at "Chip" (Apple Silicon) or "Processor" (Intel).
+
+          Java is included, so nothing else needs to be installed.
+
+          **macOS:** open the .dmg and drag Dotify Studio to Applications.
+
+          **Windows:** run the .msi. If Windows SmartScreen warns about an unrecognized app, choose "More info" and then "Run anyway".
+          EOF
+          if [ -z "$MAC_SIGNED" ]; then
+            cat >> notes.md <<'EOF'
+
+          **The macOS app isn't signed by Apple yet.** The first time, macOS says it "can't be opened" or "is damaged". To open it anyway, open System Settings > Privacy & Security and choose "Open Anyway" next to Dotify Studio, or run this in Terminal after moving the app to Applications:
+
+              xattr -cr "/Applications/Dotify Studio.app"
+          EOF
+          fi
+        env:
+          MAC_SIGNED: ${{ secrets.MACOS_CERTIFICATE != '' && secrets.APPLE_ID != '' && 'yes' || '' }}
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          prerelease=()
+          case "$GITHUB_REF_NAME" in *-*) prerelease=(--prerelease);; esac
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            # Re-run of the workflow for the same tag: replace the files.
+            gh release upload "$GITHUB_REF_NAME" installers/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" installers/* "${prerelease[@]}" \
+              --title "Dotify Studio ${GITHUB_REF_NAME#v}" --notes-file notes.md --generate-notes
+          fi

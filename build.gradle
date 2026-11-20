@@ -1,11 +1,25 @@
 plugins {
 	id 'base'
-	id "de.inetsoftware.setupbuilder" version "3.4.3"
-	id 'edu.sc.seis.launch4j' version '2.4.2'
+	id "de.inetsoftware.setupbuilder" version "8.4.22"
+	id 'edu.sc.seis.launch4j' version '4.0.0'
+}
+
+// The platform defaults to the build machine. Override it with -PtargetOs=macos|windows|linux and
+// -PtargetArch=aarch64|x64, for example to build the Intel macOS installer on an Apple Silicon Mac.
+def hostOsName = System.getProperty('os.name').toLowerCase()
+def targetOs = project.findProperty('targetOs') ?: (hostOsName.contains('mac') ? 'macos' : hostOsName.contains('win') ? 'windows' : 'linux')
+def targetArch = project.findProperty('targetArch') ?: (System.getProperty('os.arch') in ['aarch64', 'arm64'] ? 'aarch64' : 'x64')
+if (!(targetOs in ['macos', 'windows', 'linux'])) {
+	throw new GradleException("Unsupported targetOs '${targetOs}'. Use macos, windows or linux.")
+}
+if (!(targetArch in ['aarch64', 'x64'])) {
+	throw new GradleException("Unsupported targetArch '${targetArch}'. Use aarch64 or x64.")
 }
 
 def resourceDir = 'build-resources'
-def tempDir = 'build/tmp'
+// The files to install are staged per platform, so that files added for one platform
+// (such as the Windows launcher) don't end up in another platform's installer.
+def tempDir = "build/tmp/app-${targetOs}"
 
 def artifactName = "dotify-studio"
 def appBase = "${tempDir}/dotify-studio"
@@ -17,17 +31,17 @@ configurations {
 
 repositories {
     mavenCentral()
-    //mavenLocal()
-    maven { url "https://oss.sonatype.org/content/groups/staging" }
-    //maven { url "https://oss.sonatype.org/content/repositories/snapshots" }
+    // Needed until the Java 21 build of dotify-studio is released.
+    // Run './gradlew publishToMavenLocal' in dotify-studio first.
+    mavenLocal()
 }
 
 dependencies {
-	app ("org.daisy.dotify:$artifactName:$version@zip") {
-		transitive false
+	app ("org.daisy.dotify:$artifactName:$dotifyStudioVersion@zip") {
+		transitive = false
 	}
 	appPlugins ('se.mtm.addons:mtm-dotify-addons:4.0.0') {
-		transitive false
+		transitive = false
 	}
 }
 
@@ -104,15 +118,53 @@ task createLaunch4jManifest(description: 'Creates the Launch4j manifest from a t
 	outputs.upToDateWhen{ file('gradle.properties').lastModified()<file(launch4jManifest).lastModified() }
 }
 
-createExe.dependsOn('createLaunch4jManifest')
+// createExe reads the jar from the staged files, so stage them first.
+createExe.dependsOn('createLaunch4jManifest', 'unzip', 'deleteBin', 'copyIcon', 'copyPlugins')
+
+// A Java 21 runtime that includes JavaFX (Azul Zulu FX) is bundled with the macOS and Windows installers.
+def jreVersion = '21'
+def jreDir = layout.buildDirectory.dir("jre/${targetOs}-${targetArch}").get().asFile
+
+task downloadJre(description: 'Downloads a Java runtime with JavaFX for the target platform.') {
+	inputs.property('targetOs', targetOs)
+	inputs.property('targetArch', targetArch)
+	outputs.dir jreDir
+	doLast {
+		def os = targetOs
+		def arch = targetArch
+		def query = "https://api.azul.com/metadata/v1/zulu/packages/?java_version=${jreVersion}&os=${os}&arch=${arch}" +
+			"&java_package_type=jre&javafx_bundled=true&archive_type=zip&latest=true&release_status=ga&availability_types=CA&page_size=1"
+		def packages = new groovy.json.JsonSlurper().parse(URI.create(query).toURL())
+		if (!packages) {
+			throw new GradleException("No Java ${jreVersion} runtime with JavaFX found for ${os}/${arch}")
+		}
+		def zip = new File(temporaryDir, packages[0].name)
+		logger.lifecycle("Downloading ${packages[0].download_url}")
+		zip.withOutputStream { out -> URI.create(packages[0].download_url).toURL().withInputStream { out << it } }
+		project.delete(jreDir)
+		project.copy {
+			from zipTree(zip)
+			into jreDir
+		}
+	}
+}
+
+// The runtime's home folder (the one that contains bin/java) inside the downloaded archive.
+def jreHome = {
+	def java = fileTree(jreDir).matching { include '**/bin/java', '**/bin/java.exe' }.files
+	if (java.isEmpty()) {
+		throw new GradleException("No Java runtime found in ${jreDir}. Run the downloadJre task.")
+	}
+	return java.iterator().next().parentFile.parentFile
+}
 
 setupBuilder {
     vendor = 'DAISY Consortium'
     application = releaseName
     appIdentifier = artifactName
     description = 'Creates, manages and embosses PEF-files'
-    mainJar = "lib/${artifactName}-${version}.jar"
-    mainClass = 'application.ui.MainFx'
+    mainJar = "lib/${artifactName}-${dotifyStudioVersion}.jar"
+    mainClass = 'application.ui.Launcher'
     //licenseFile = 'license.txt'
     // icons in different sizes for different usage. you can also use a single *.ico or *.icns file
 	icons = ['build-resources/app-icon.ico']
@@ -123,24 +175,23 @@ setupBuilder {
     failOnEmptyFrom=true
 }
 
-task msi32( type: com.inet.gradle.setup.msi.Msi ) {
-	//32 bit specifics
-    arch = "x86"
-    classifier = "x86"
-}
-
 launch4j {
-	mainClassName = 'application.ui.MainFx'
+	mainClassName = 'application.ui.Launcher'
 	dontWrapJar = true
-	icon = '../../build-resources/app-icon.ico'
-	manifest = '../launch4j.manifest'
-	jar = "lib/${artifactName}-${version}.jar"
-	copyConfigurable = files { file("${tempDir}/dotify-studio/lib").listFiles() }
+	icon = file('build-resources/app-icon.ico').absolutePath
+	manifest = launch4jManifest.absolutePath
+	jarFiles = files("${appBase}/lib/${artifactName}-${dotifyStudioVersion}.jar")
+	libraryDir = 'lib'
+	copyConfigurable = files()
 	outfile = 'dotify-studio.exe'
 	bundledJrePath = 'jre'
+	// Without this, launch4j requires the Java version that runs Gradle, which can be newer than
+	// the bundled runtime. The exe then refuses to start ("requires a Java Runtime Environment").
+	jreMinVersion = jreVersion
+	requires64Bit = true
 }
 
-configure( [msi, msi32] ) {
+configure( [msi] ) {
     // included to reduce the build time
     languages = ['en-US']
     wxsTemplate = './build-resources/template.wxs'
@@ -153,9 +204,93 @@ configure( [msi, msi32] ) {
 		        executable = "dotify-studio.exe"
 		        location = "ApplicationMenu"
 		    }
-		    bundleJre = 1.8
+		    bundleJre = jreHome()
         }
     }
+}
+
+msi {
+	classifier = "windows-${targetArch}"
+}
+
+def macArch = targetArch == 'aarch64' ? 'arm64' : 'x86_64'
+
+dmg {
+	classifier = targetArch == 'aarch64' ? 'macos-apple-silicon' : 'macos-intel'
+	// The default list is for Java 8 and leaves out conf/, which Java 9 and later need.
+	jreIncludes = ['bin/**', 'conf/**', 'legal/**', 'lib/**', 'release']
+	// Match the bundled runtime. Otherwise macOS may start the Intel launcher (via Rosetta)
+	// on Apple Silicon, which cannot load an arm64 runtime ("Unable to load Java Runtime Environment").
+	architecture = [macArch]
+	// setupbuilder writes an uncompressed image. Fix up the app inside it, then compress it.
+	//
+	// For distribution, pass -PmacSigningIdentity="Developer ID Application: <name> (<team id>)"
+	// to sign the app and the image, and -PmacNotaryProfile=<profile> to also notarize the image
+	// (create the profile with 'xcrun notarytool store-credentials <profile>'). Without them the
+	// image works on the Mac that built it, but macOS blocks it after it has been downloaded.
+	def signingIdentity = project.findProperty('macSigningIdentity')
+	def notaryProfile = project.findProperty('macNotaryProfile')
+	def signScript = file('scripts/sign-mac-app.sh').absolutePath
+	inputs.property('macSigningIdentity', signingIdentity ?: '')
+	inputs.property('macNotaryProfile', notaryProfile ?: '')
+	doFirst {
+		if (notaryProfile && (!signingIdentity || signingIdentity == '-')) {
+			throw new GradleException('Notarizing requires -PmacSigningIdentity with a Developer ID certificate')
+		}
+	}
+	doLast {
+		def run = { List<String> cmd ->
+			def process = new ProcessBuilder(cmd).inheritIO().start()
+			if (process.waitFor() != 0) {
+				throw new GradleException("Command failed: ${cmd.join(' ')}")
+			}
+		}
+		[setupFile].each { image ->
+			def writable = new File(temporaryDir, 'rw.dmg')
+			def mountPoint = new File(temporaryDir, 'mnt')
+			def compressed = new File(temporaryDir, image.name)
+			project.delete(writable, mountPoint, compressed)
+			run(['hdiutil', 'convert', image.absolutePath, '-format', 'UDRW', '-o', writable.absolutePath])
+			if (signingIdentity) {
+				// Make room for the signatures. Free space compresses to almost nothing.
+				run(['hdiutil', 'resize', '-size', '1g', writable.absolutePath])
+			}
+			run(['hdiutil', 'attach', writable.absolutePath, '-nobrowse', '-noautoopen', '-mountpoint', mountPoint.absolutePath])
+			try {
+				// The launcher is a universal binary, but the bundled runtime only has one architecture.
+				// Keep only the matching slice: if the user has "Open using Rosetta" set for the app
+				// (for example left over from an older Intel-only version), macOS would otherwise start
+				// the Intel launcher, which fails with "Unable to load Java Runtime Environment".
+				fileTree(mountPoint) { include '*.app/Contents/MacOS/*' }.each { launcher ->
+					def archs = ['lipo', '-archs', launcher.absolutePath].execute().text.trim().split(/\s+/) as List
+					if (!archs.contains(macArch)) {
+						throw new GradleException("${launcher} has ${archs}, but the bundled runtime needs ${macArch}")
+					}
+					if (archs.size() > 1) {
+						run(['lipo', launcher.absolutePath, '-thin', macArch, '-output', launcher.absolutePath])
+					}
+				}
+				if (signingIdentity) {
+					fileTree(mountPoint) { include '*.app/Contents/Info.plist' }.each { plist ->
+						run([signScript, plist.parentFile.parentFile.absolutePath, signingIdentity])
+					}
+				}
+			} finally {
+				run(['hdiutil', 'detach', mountPoint.absolutePath])
+			}
+			run(['hdiutil', 'convert', writable.absolutePath, '-format', 'UDZO', '-o', compressed.absolutePath])
+			java.nio.file.Files.move(compressed.toPath(), image.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+			project.delete(writable)
+			if (signingIdentity && signingIdentity != '-') {
+				run(['codesign', '--force', '--timestamp', '--sign', signingIdentity, image.absolutePath])
+			}
+			if (notaryProfile) {
+				run(['xcrun', 'notarytool', 'submit', image.absolutePath, '--keychain-profile', notaryProfile, '--wait'])
+				run(['xcrun', 'stapler', 'staple', image.absolutePath])
+				run(['spctl', '--assess', '--type', 'open', '--context', 'context:primary-signature', '-v', image.absolutePath])
+			}
+		}
+	}
 }
 
 configure( [dmg] ) {
@@ -165,7 +300,7 @@ configure( [dmg] ) {
 				displayName = releaseName
 				description = appDescription
 			}
-			bundleJre = 1.8
+			bundleJre = jreHome()
 		}
 	}
 }
@@ -186,9 +321,8 @@ configure( [deb, rpm] ) {
     }
 }
 
-msi.dependsOn('unzip', 'deleteBin', 'copyIcon', 'copyPlugins', 'copyExe')
-msi32.dependsOn('unzip', 'deleteBin', 'copyIcon', 'copyPlugins', 'copyExe')
-dmg.dependsOn('unzip', 'copyPlugins')
+msi.dependsOn('downloadJre', 'unzip', 'deleteBin', 'copyIcon', 'copyPlugins', 'copyExe')
+dmg.dependsOn('downloadJre', 'unzip', 'copyPlugins')
 deb.dependsOn('unzip', 'copyPlugins')
 rpm.dependsOn('unzip', 'copyPlugins')
 
@@ -200,90 +334,6 @@ deb {
 
 rpm {
     postinst = 'chmod +x /usr/share/dotify-studio/bin/dotify-studio'
-}
-
-// Javapackager
-
-ant.taskdef (resource:'com/sun/javafx/tools/ant/antlib.xml', 
-	uri: 'javafx:com.sun.javafx.tools.ant',
-	// JDK is required. Also, cannot use java.home because it might return the jre.
-	classpath: System.getenv("JAVA_HOME") + '/lib/ant-javafx.jar'
-)
-
-def javaPackagerFolder = file('build/javapackager');
-
-ext.runJavaPackager = { bundles, appIcon, appName ->
-	String path = javaPackagerFolder.getAbsolutePath()
-
-	ant {
-		'javafx:com.sun.javafx.tools.ant:deploy'(outdir: path, outfile: 'dotify-studio', nativeBundles: bundles) { 
-			info(title: releaseName, description: appDescription, category: 'Office') {
-				icon(href: appIcon)
-				association(
-					extension: 'pef',
-					description: 'Portable embosser format',
-					mimetype: 'application/x-pef+xml'
-				)
-				association(
-					extension: 'obfl',
-					description: 'Open braille formatting language',
-					mimetype: 'application/x-obfl+xml'
-				)
-			}
-			application(
-				name: appName, 
-				mainClass: 'application.ui.MainFx',
-				version: version
-			)
-			resources {
-				fileset(dir: "${tempDir}/dotify-studio", includes: '**/*.*')
-			}
-			bundleArgument(arg: 'email', value: 'joel.hakansson@mtm.se')
-			bundleArgument(arg: 'win.menuGroup', value: releaseName)
-		}
-	}
-
-}
-
-task jpMsi(dependsOn: ['deleteBinFlatLib', 'copyPluginsFlatLib'], description: 'Uses javapackager to create msi installer (experimental).') {
-	doLast() {
-		runJavaPackager('msi', file('build-resources/app-icon.ico').getAbsolutePath(), 'dotify-studio')
-	}
-	outputs.dir javaPackagerFolder
-}
-
-task jpDeb(dependsOn: 'unzip', description: 'Uses javapackager to create deb installer (experimental).') {
-	doLast() {
-		runJavaPackager('deb', file('build-resources/app-icon.png').getAbsolutePath(), releaseName)
-	}
-	outputs.dir javaPackagerFolder
-}
-
-task jpRpm(dependsOn: 'unzip', description: 'Uses javapackager to create rpm installer (experimental).') {
-	doLast() {
-		runJavaPackager('rpm', file('build-resources/app-icon.png').getAbsolutePath(), releaseName)
-	}
-	outputs.dir javaPackagerFolder
-}
-
-task javapackager(dependsOn: 'unzip', description: 'Uses javapackager to create installers (experimental).') {
-	doLast() {
-		String path = file('build/javapackager').getAbsolutePath()
-		String filename = 'dotify-studio'
-		ant {
-			'javafx:com.sun.javafx.tools.ant:deploy'(outdir: path, outfile: filename, nativeBundles: 'installer') { 
-				info(title: releaseName, description: appDescription)
-				application(
-					name: filename, 
-					mainClass: 'application.ui.MainFx',
-					version: version
-				)
-				resources {
-					fileset(dir: "${tempDir}/dotify-studio", includes: '**/*.*')
-				}
-			}
-		}
-	}
 }
 
 wrapper {
